@@ -79,4 +79,4 @@ You need API access to **your own** Botpress bot for the dashboard to show data.
 
 ## 📄 License
 
-No license yet — add one (e.g. MIT) if you'd like others to reuse the code.
+No license yet
