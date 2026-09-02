@@ -312,6 +312,8 @@ details[open]>summary{margin-bottom:4px}
       <input type="text" id="iBotId" placeholder="01abc123-…"></div>
     <div class="field"><label>Groq API Key <span style="color:var(--muted);font-weight:400">(optional — enables AI ticket re-analysis)</span></label>
       <input type="password" id="iGroqKey" placeholder="gsk_…"></div>
+    <div class="field"><label>Groq model <span style="color:var(--muted);font-weight:400">(current model ID — see console.groq.com/docs/models)</span></label>
+      <input type="text" id="iGroqModel" placeholder="openai/gpt-oss-20b"></div>
     <div class="field"><label>Fetch depth (how far back to load)</label>
       <select id="iFetchDepth" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 13px;color:var(--text);font-size:14px;outline:none;transition:border .15s">
         <option value="1d">Last 24 hours</option>
@@ -345,6 +347,7 @@ details[open]>summary{margin-bottom:4px}
   <div class="hdr-right">
     <div class="conn-badge"><div class="dot" id="dot"></div><span id="connText">Not connected</span></div>
     <button class="btn btn-ghost" id="btnRefreshHdr" style="display:none">↻ Refresh</button>
+    <button class="btn btn-ghost" id="btnExport" title="Download an Excel/CSV report of limitations, questions & intents, and where the bot couldn't answer (current period)">⬇ Export</button>
     <button class="btn btn-ghost" id="btnSettingsHdr">⚙ Settings</button>
   </div>
 </header>
@@ -439,8 +442,11 @@ details[open]>summary{margin-bottom:4px}
 // ═══════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════
-let cfg = { pat:'', botId:'', groqKey:'', refreshInterval:0, fetchDepth:'30d' };
-const LLM_MODEL = 'llama-3.3-70b-versatile';
+// Groq deprecates model IDs periodically, so the model is configurable in Settings.
+// Default is a widely-available current model; change it in Settings to any current Groq model
+// (see console.groq.com/docs/models) — e.g. openai/gpt-oss-120b for higher quality.
+const DEFAULT_LLM_MODEL = 'openai/gpt-oss-20b';   // current Groq model (2026); switch to openai/gpt-oss-120b for higher quality
+let cfg = { pat:'', botId:'', groqKey:'', groqModel:DEFAULT_LLM_MODEL, refreshInterval:0, fetchDepth:'30d' };
 let dataLoadedAt = null;
 let dataSource   = 'none'; // 'live' | 'demo'
 let conversations = [];
@@ -450,7 +456,23 @@ let searchQuery = '';
 let activePeriod = '14d';
 let highlightFilter = 'all';   // Highlights tab: 'all' or a specific issue type label
 let highlightSev = 'all';      // Highlights tab: 'all' | 'high' | 'medium' | 'low'
+let manualOverrides = {};      // { convId: 'correct'|'investigate'|'fix' } — human review verdicts
 let refreshTimer = null;
+
+function saveOverrides() { try { localStorage.setItem('bpm2_overrides', JSON.stringify(manualOverrides)); } catch {} }
+function loadOverrides() { try { const s = JSON.parse(localStorage.getItem('bpm2_overrides')||'null'); if (s && typeof s === 'object') manualOverrides = s; } catch {} }
+// Set/clear a human review verdict on a conversation, then refresh every view that depends on it.
+function setOverride(id, verdict) {
+  if (!verdict || verdict === 'auto') delete manualOverrides[id];
+  else manualOverrides[id] = verdict;
+  saveOverrides();
+  renderFilterChips(); renderList();
+  if (typeof renderTopicsInsights === 'function') renderTopicsInsights();
+  if (typeof renderAnalytics === 'function') renderAnalytics();
+  if (typeof renderErrorAnalysis === 'function') renderErrorAnalysis();
+  if (typeof renderHighlights === 'function') renderHighlights();
+  if (activeId === id) selectConv(id);   // re-render the detail panel (updates the control + label)
+}
 
 // ═══════════════════════════════════════════
 // INTENT TAXONOMY
@@ -923,6 +945,15 @@ function detectBotLimitRequests(conv) {
   return BOT_LIMITS.filter(bl => bl.kw.some(p => p.test(inText))).map(bl => bl.key);
 }
 
+// The bot EXPLICITLY declining an out-of-scope request in ITS OWN words ("Ich kann keine Produkte
+// empfehlen", "kann keine Rechnung senden", "kann bei der Anfertigung nicht helfen") is a
+// definitive "correct escalation" signal — stronger than the AI's guess at the user's request type.
+const BOT_DECLINE_RE = /keine produkte?\s*(empfehl|durchsuch|vorschläg|vorschlag)|keine (produkt)?empfehlung(en)?\s*(geben|aussprech|machen|abgeben)|(bei der (produkt)?auswahl|bei produktempfehlung(en)?|bei der produktberatung)\s*(leider\s*)?nicht\s*(direkt\s*)?(helfen|weiterhelfen|unterstützen)|keine produkte?\s*vergleich|keine (rechnung(en)?|preise|preisliste|preisinformation(en)?|links?)\s*(senden|schicken|versenden|bereitstell|weitergeb)|keine bilder\s*(ansehen|sehen|verarbeit|öffnen)|bestellung(en)?\s*(leider\s*)?nicht\s*(stornier|änder|bearbeit)|(anfertigung|sonderanfertigung|maßanfertigung|fertigung)\s*[^.?!]{0,45}(nicht|leider nicht)/i;
+function detectBotDeclinedScope(conv) {
+  const out = (conv._messages||[]).filter(m=>m.direction==='outgoing').map(m=>getText(m)).join(' ');
+  return BOT_DECLINE_RE.test(out);
+}
+
 function detectQualityErrors(conv) {
   const msgs    = conv._messages || [];
   const inText  = msgs.filter(m=>m.direction==='incoming').map(m=>getText(m)).join(' ');
@@ -972,14 +1003,122 @@ function categorizeOutcome(c) {
   if (c._status === 'resolved')   return 'resolved';
   if (c._status === 'incomplete') return 'dropped';
   if (c._status !== 'ticket')     return 'other';
-  // AI second pass (if it ran) is the authority for ticket verdicts — it reads the whole
-  // conversation instead of guessing from the ragScore heuristic.
-  if (c._llmVerdict && ['correct','investigate','fix'].includes(c._llmVerdict.verdict)) return c._llmVerdict.verdict;
-  if (detectQualityErrors(c).hasAny)        return 'fix';        // real mistake
-  if (detectBotLimitRequests(c).length)     return 'correct';    // out of scope by design
+  // A human review verdict beats everything — this is how the "actual result" is corrected.
+  const ov = manualOverrides[c.id];
+  if (ov === 'correct' || ov === 'investigate' || ov === 'fix') return ov;
+  // A real quality error always wins (AI verdict OR deterministic detector).
+  if (c._llmVerdict?.verdict === 'fix' || detectQualityErrors(c).hasAny) return 'fix';
+  // The bot explicitly declining an out-of-scope request — in the user's ASK (detectBotLimitRequests)
+  // OR in the bot's own words (detectBotDeclinedScope, e.g. "Ich kann keine Produkte empfehlen") — is a
+  // definitive CORRECT escalation, and OVERRIDES a wrong "investigate" verdict from the AI.
+  if (detectBotLimitRequests(c).length || detectBotDeclinedScope(c)) return 'correct';
+  // Otherwise trust the AI second pass (it read the whole conversation).
+  if (c._llmVerdict && ['correct','investigate'].includes(c._llmVerdict.verdict)) return c._llmVerdict.verdict;
+  // Heuristic fallback.
   if ((c._topics||[]).includes('complaint')) return 'correct';   // complaints need a human
   if ((c._analysis?.ragScore ?? 65) >= 60)  return 'investigate';// had info but escalated
   return 'correct';                                              // genuinely lacked info — KB gap, escalation appropriate
+}
+
+// ── Unified conversation classification for the "Actual Bot Results" analytics ──
+// Axes: user intent · outcome · escalation reason · canonical question.
+function classifyConv(c) {
+  const f = c._llmFlags || {};
+  const intent = ['genuine','testing','abuse'].includes(f.userIntent) ? f.userIntent : 'genuine';
+  // Prefer the AI's canonical question; without it, group by intent/topic (NOT the first
+  // message, which is usually just a greeting like "Hallo").
+  const question = (f.questionLabel && f.questionLabel.trim())
+    || (c._topics && c._topics.length ? intentLabel(c._topics[0]) : '')
+    || 'Other';
+
+  let outcome, escReason = '';
+  const st = c._status;
+  const vv = c._llmVerdict || {};
+  const OUT = ['recommendation','comparison','compatibility','invoice_price','link','image','order_or_account'];
+  if (st === 'resolved') {
+    outcome = 'answered';
+  } else if (st === 'ticket') {
+    // categorizeOutcome prefers the AI verdict but falls back to the heuristic (RAG score, etc.),
+    // so an un-judged ticket is NOT silently treated as a success.
+    const cat = categorizeOutcome(c);   // 'correct' | 'investigate' | 'fix'
+    const rt  = vv.requestType;
+    if (cat === 'fix')                { outcome = 'error';                escReason = 'error'; }
+    else if (f.blockedByMissingInfo)  { outcome = 'correct_escalation';   escReason = 'needs_user_info'; }
+    else if (cat === 'investigate')   { outcome = 'avoidable_escalation'; escReason = 'had_info'; }
+    else                              { outcome = 'correct_escalation';
+      escReason = rt === 'complaint' ? 'complaint' : OUT.includes(rt) ? 'out_of_scope' : 'kb_gap'; }
+  } else if (st === 'incomplete') {
+    outcome = (f.abandonmentState === 'struggling') ? 'dropped_bad' : 'dropped_ok';
+  } else {
+    outcome = 'pending';
+  }
+  return { intent, outcome, escReason, question };
+}
+// success = bot did right · failure = bot's fault · excluded = neutral (nonsense/abuse/dropped-fine/pending)
+function outcomeBucket(cls) {
+  if (cls.intent !== 'genuine') return 'excluded';
+  if (cls.outcome === 'answered' || cls.outcome === 'correct_escalation') return 'success';
+  if (cls.outcome === 'avoidable_escalation' || cls.outcome === 'error' || cls.outcome === 'dropped_bad') return 'failure';
+  return 'excluded';
+}
+
+// ── Language / localization analysis (default shop language is German) ──
+// Any explicit reference by the USER to a conversation language (bare language names for non-German,
+// plus German only in a language context to avoid matching "deutsche Post"/"deutsche Größe").
+const LANG_REQUEST_RE = /\b(englisch|english|französisch|french|türkisch|turkish|russisch|russian|italienisch|italian|spanisch|spanish|polnisch|polish|niederländisch|dutch|arabisch|arabic)\b|(auf|in|kein|to)\s+deutsch|deutsch\s+(bitte|antworten|sprechen|reden)|change (the )?language|(andere[rn]?|another)\s+sprache|switch to (english|german|deutsch)|do you speak|parlez[- ]vous|sprechen sie/i;
+const LANG_ANGRY_RE = /\b(unmöglich|frech(heit)?|ärgerlich|katastrophe|beschwerde|enttäuscht|verärgert|wütend|inakzeptabel|unverschämt|schrecklich|warum (auf )?englisch|why (in )?english|not german|kein deutsch|useless|terrible|awful|angry|frustrat\w*|ridiculous|unacceptable)\b|!{2,}/i;
+const LANG_HAPPY_RE = /\b(super|toll|perfekt|vielen dank|danke schön|great|perfect|excellent|awesome|sehr gut|prima|klasse|wunderbar|thank you (so much|very much))\b/i;
+
+// The whole user side has no German signal at all → treat the conversation as non-German.
+function convIsNonGerman(conv) {
+  const t = (conv._messages||[]).filter(m=>m.direction==='incoming').map(m=>getText(m)).join(' ').toLowerCase();
+  const words = t.split(/\s+/).filter(w => w.length > 1);
+  if (words.length < 3) return false;   // too little text to judge
+  const de = (t.match(/[äöüß]/g)||[]).length +
+    (t.match(/\b(der|die|das|und|ich|nicht|wie|was|für|mit|ist|sind|haben|kann|können|bitte|danke|keine|eine|einen|mein|meine|ihre|wir|sie|oder|aber|über|auch|noch|schon|brauche|möchte|hallo|guten|tag|wo|wann|warum|welche[rn]?|dass|sehr|geehrte|damen|herren|frage|bestellung|produkt|artikel)\b/g)||[]).length;
+  return de === 0;
+}
+function detectLanguageMention(conv) {
+  const userText = (conv._messages||[]).filter(m=>m.direction==='incoming').map(m=>getText(m)).join(' ');
+  if (!LANG_REQUEST_RE.test(userText)) return null;
+  return { sentiment: LANG_ANGRY_RE.test(userText) ? 'angry' : LANG_HAPPY_RE.test(userText) ? 'happy' : 'neutral' };
+}
+function analyzeLanguages(convs) {
+  let nonGerman = 0; const mentions = [];
+  for (const c of convs) {
+    if (convIsNonGerman(c)) nonGerman++;
+    const m = detectLanguageMention(c);
+    if (m) mentions.push({ c, sentiment: m.sentiment });
+  }
+  return { total: convs.length, nonGerman, mentions };
+}
+function renderLanguageCard(convs) {
+  const s = analyzeLanguages(convs);
+  const pct = s.total ? Math.round(s.nonGerman / s.total * 100) : 0;
+  const sIcon = { angry:'😠', happy:'😊', neutral:'😐' };
+  const sColor = { angry:'var(--complaint)', happy:'var(--resolved)', neutral:'var(--muted)' };
+  const rows = s.mentions.length ? s.mentions.map(m => `
+    <div onclick="selectConvAndSwitch('${m.c.id}')" style="cursor:pointer;display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--surface);border-radius:6px;margin-bottom:5px">
+      <span style="font-size:15px" title="${m.sentiment}">${sIcon[m.sentiment]}</span>
+      <span style="flex:1;min-width:0;font-size:12px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((m.c._preview||m.c.id).slice(0,70))}</span>
+      <span style="font-size:10px;font-weight:700;color:${sColor[m.sentiment]};flex-shrink:0">${m.sentiment} →</span>
+    </div>`).join('') : '<div style="font-size:12px;color:var(--muted);padding:6px 0">No language-change requests detected in this period.</div>';
+  return `<div class="chart-card">
+    <h3>🌍 Language & Localization</h3>
+    <p style="font-size:12px;color:var(--text2);margin:8px 0 14px">Default shop language is German. Localization now replies in the user's browser language — this tracks non-German chats and anyone reacting to it.</p>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px">
+      <div style="flex:1;min-width:150px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px 16px">
+        <div style="font-size:24px;font-weight:800;color:${pct>0?'var(--pending)':'var(--resolved)'}">${s.nonGerman}</div>
+        <div style="font-size:12.5px;color:var(--text);margin-top:2px">Non-German conversations <span style="color:var(--muted)">(${pct}%)</span></div>
+      </div>
+      <div style="flex:1;min-width:150px;background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px 16px">
+        <div style="font-size:24px;font-weight:800;color:${s.mentions.length?'var(--accent2)':'var(--muted)'}">${s.mentions.length}</div>
+        <div style="font-size:12.5px;color:var(--text);margin-top:2px">Language-change requests</div>
+      </div>
+    </div>
+    <div style="font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Who mentioned the language (click to open)</div>
+    ${rows}
+  </div>`;
 }
 
 function detectTicketReason(conv) {
@@ -1024,12 +1163,20 @@ function detectBehaviorIssues(conv) {
   // Template / raw-variable leak: bot exposed unrendered variables or template syntax to the
   // user (e.g. "${user.name}", "{{content}}", HTML-encoded "&#123;…&#125;").
   const leakRe = /\$\{|\{\{|\}\}|&#12[35];|\$&#|\[object Object\]|\bundefined\b/;
+  // Customer complaining that no buttons/options are shown — the most reliable "missing buttons"
+  // signal (the user literally says they see none). DE + EN phrasings.
+  const complaintRe = /\bwelche (buttons?|knöpfe|optionen|auswahl)\b|ich sehe kein[e]? (buttons?|optionen|auswahl|knöpfe|auswahlmöglichkeiten)|wo sind die (buttons?|optionen|auswahl)|keine (buttons?|optionen|auswahl|auswahlmöglichkeiten) (da|sichtbar|angezeigt|zu sehen)|es (werden|sind) keine (buttons?|optionen)|which buttons?\b|i (don'?t|do not|can'?t) see (any )?(buttons?|options?|choices?)|no (buttons?|options?) (shown|visible|appear)/i;
   let leak = false, leakText = '';
   let buttonGap = false, gapText = '', gapKind = '';
+  let buttonComplaint = false, complaintText = '';
   for (let i = 0; i < ms.length; i++) {
     const m = ms[i];
-    if (m.direction !== 'outgoing') continue;
-    const txt = getText(m) || '';
+    const inTxt = getText(m) || '';
+    if (m.direction === 'incoming') {
+      if (!buttonComplaint && complaintRe.test(inTxt)) { buttonComplaint = true; complaintText = inTxt.slice(0, 200); }
+      continue;
+    }
+    const txt = inTxt;
     if (!leak && leakRe.test(txt)) { leak = true; leakText = txt.slice(0, 200); }
     if (!buttonGap && (m.payload && m.payload.type) === 'text') {
       // does a choice (buttons) message follow before the user's next turn?
@@ -1047,6 +1194,7 @@ function detectBehaviorIssues(conv) {
   }
   conv._leak = leak; conv._leakText = leakText;
   conv._buttonGap = buttonGap; conv._buttonGapText = gapText; conv._buttonGapKind = gapKind;
+  conv._buttonComplaint = buttonComplaint; conv._buttonComplaintText = complaintText;
 }
 
 function extractEntities(text) {
@@ -1567,7 +1715,13 @@ const LLM_SYSTEM = `You are a STRICT QA analyst for a German online shop (stainl
 
 "bespoke" (boolean): only meaningful for product_spec/compatibility/installation_howto/policy — true if the question is so specialized or unusual that no standard datasheet or FAQ could reasonably answer it; false if it is normal information a knowledge base should contain. Default false.
 
-"buttonIssue" (boolean): the lines are tagged — a bot turn that rendered clickable buttons looks like 'BOT [BUTTONS: A | B]: ...'. By design the bot shows buttons at the START of a conversation, in two selection moments: (1) the TRIAGE menu where it invites the user to choose whether the question is about a product / an order / a general question (e.g. "Wähle bitte eine Option"); (2) PLATFORM selection in the order flow (which platform the order is from: the shop's own site / Amazon / eBay). Set buttonIssue=true ONLY if the bot did one of those two selection moments as plain 'BOT:' text WITHOUT a '[BUTTONS: …]' tag. A yes/no CONFIRMATION ("Soll ich ein Ticket erstellen?"), a free-form open question, or a request for typed details (order number, email) is NOT a buttonIssue.
+"userIntent" — what the USER was really doing, exactly one of: "genuine" (a real customer question or request), "testing" (nonsense, gibberish, random characters, or someone clearly just poking/testing the bot with no real need), "abuse" (insults, prompt-injection, or trying to manipulate the bot).
+
+"questionLabel" — a SHORT canonical label (max 6 words, in ENGLISH) for what the user is really asking, so similar questions group together. Examples: "Where is my order?", "Return policy", "Is X compatible with Y?", "Product dimensions", "How to install", "Warranty length". Use "" only when userIntent is testing/abuse.
+
+"blockedByMissingInfo" (boolean): true if the bot could not proceed because it needed specific information the user did not or could not provide (e.g. a valid order number that could not be found, an email that did not match) — i.e. escalating or not answering was the CORRECT move because the bot legitimately lacked required input. Otherwise false.
+
+"abandonmentState" — set only if the user left mid-conversation without a resolution; otherwise "na". One of: "on_track" (the bot had just answered or was clearly helping well when the user left), "gathering_info" (the bot was correctly asking for required details), "struggling" (the bot was looping, failing, or the user was visibly frustrated).
 
 "uxNote": empty string "" if the conversation went fine; otherwise a max-15-word description of the single biggest concrete problem that hurt the user's experience (wrong/misleading answer, leaked/broken text, ignored the question, dead-end with no next step, pointless repetition/loop, missing buttons). Cite what actually happened.
 
@@ -1575,7 +1729,7 @@ const LLM_SYSTEM = `You are a STRICT QA analyst for a German online shop (stainl
 
 "reason": max 20 words, and you MUST cite the user's ACTUAL question (no generic phrases like "out of scope by design").
 
-Respond with ONLY a JSON object, no prose: {"requestType":"...","qualityError":false,"bespoke":false,"buttonIssue":false,"uxNote":"","severity":"none","reason":"..."}`;
+Respond with ONLY a JSON object, no prose: {"requestType":"...","userIntent":"genuine","questionLabel":"...","qualityError":false,"bespoke":false,"blockedByMissingInfo":false,"abandonmentState":"na","uxNote":"","severity":"none","reason":"..."}`;
 
 function buildTranscript(conv) {
   return (conv._messages||[])
@@ -1591,29 +1745,45 @@ function buildTranscript(conv) {
     })
     .filter(l => l.length > 6)
     .join('\n')
-    .slice(0, 8000);
+    .slice(0, 5000);   // cap keeps per-call tokens down so large batches don't blow the rate limit
 }
 
 async function llmClassifyTicket(conv) {
   const transcript = buildTranscript(conv);
-  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': 'Bearer ' + cfg.groqKey
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      max_tokens: 320,
-      temperature: 0,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: LLM_SYSTEM },
-        { role: 'user', content: `Conversation transcript:\n\n${transcript}` }
-      ]
-    })
+  // jsonMode=true uses Groq's strict json_object validator; if the model trips it (a 400
+  // "failed to generate JSON", common with reasoning models), we retry WITHOUT it and rely on the
+  // regex extraction below to pull the JSON from the reply.
+  const mkBody = (jsonMode) => JSON.stringify({
+    model: cfg.groqModel || DEFAULT_LLM_MODEL,
+    max_tokens: 800,
+    temperature: 0,
+    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+    messages: [
+      { role: 'system', content: LLM_SYSTEM },
+      { role: 'user', content: `Conversation transcript:\n\n${transcript}` }
+    ]
   });
-  if (!r.ok) throw new Error('LLM ' + r.status + ': ' + (await r.text()).slice(0, 200));
+  let jsonMode = true, r, lastErr = '';
+  for (let attempt = 0; attempt < 6; attempt++) {
+    r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + cfg.groqKey },
+      body: mkBody(jsonMode)
+    });
+    if (r.ok) break;
+    const errText = await r.text();
+    lastErr = 'LLM ' + r.status + (errText ? ': ' + errText.slice(0, 120) : '');
+    if (r.status === 429 || r.status >= 500) {
+      const ra = parseFloat(r.headers.get('retry-after') || '');
+      const wait = (ra > 0 ? ra * 1000 + 300 : 1500 * (attempt + 1)) + Math.floor(attempt * 400);
+      await new Promise(res => setTimeout(res, Math.min(wait, 12000)));
+      continue;
+    }
+    // 400 "failed to generate JSON" → drop strict JSON mode and try again (regex extraction handles it).
+    if (r.status === 400 && jsonMode && /json/i.test(errText)) { jsonMode = false; continue; }
+    break; // other non-retryable (401 bad key, 400 bad model, 413 too large)
+  }
+  if (!r.ok) throw new Error(lastErr);
   const d = await r.json();
   const text = d.choices?.[0]?.message?.content || '';
   const m = text.match(/\{[\s\S]*\}/);
@@ -1622,8 +1792,9 @@ async function llmClassifyTicket(conv) {
   // The model extracts structured facts; we map them to a verdict deterministically.
   // (A 70B model classifies the request type reliably but applies pass/fail rules inconsistently,
   //  so the decision lives in code for stable, explainable results.)
-  const OUT_OF_SCOPE = ['recommendation','comparison','invoice_price','link','image','order_or_account','complaint'];
-  const KB_ANSWERABLE = ['product_spec','compatibility','installation_howto','policy'];
+  // compatibility = super-technical, answered by support by design → correct escalation (not "investigate").
+  const OUT_OF_SCOPE = ['recommendation','comparison','compatibility','invoice_price','link','image','order_or_account','complaint'];
+  const KB_ANSWERABLE = ['product_spec','installation_howto','policy'];
   let verdict;
   if (v.qualityError === true)                  verdict = 'fix';
   else if (OUT_OF_SCOPE.includes(v.requestType)) verdict = 'correct';
@@ -1631,10 +1802,15 @@ async function llmClassifyTicket(conv) {
   else if (v.requestType === 'technical_issue') verdict = 'correct';
   else                                          verdict = 'investigate';
   const sev = ['high','medium','low','none'].includes(v.severity) ? v.severity : 'none';
+  const intent = ['genuine','testing','abuse'].includes(v.userIntent) ? v.userIntent : 'genuine';
+  const aband  = ['na','on_track','gathering_info','struggling'].includes(v.abandonmentState) ? v.abandonmentState : 'na';
   return {
     verdict, reason: (v.reason || '').slice(0, 200), requestType: v.requestType || 'other',
     flags: {
-      buttonIssue: v.buttonIssue === true,
+      userIntent: intent,
+      questionLabel: (v.questionLabel || '').slice(0, 60),
+      blockedByMissingInfo: v.blockedByMissingInfo === true,
+      abandonmentState: aband,
       uxNote: (v.uxNote || '').slice(0, 160),
       severity: sev,
       qualityError: v.qualityError === true
@@ -1644,30 +1820,37 @@ async function llmClassifyTicket(conv) {
 
 async function runLlmAnalysis() {
   if (!cfg.groqKey) return;
-  // Analyze every ticket (for the correct/investigate/fix verdict) PLUS any non-ticket
-  // conversation the deterministic detectors flagged (leak or missing buttons), so the AI
-  // can add context to those highlights too — without analyzing all conversations.
-  const targets = conversations.filter(c => !isEmpty(c) &&
-    (c._status === 'ticket' || c._leak || c._buttonGap));
+  // Analyze TICKETS first (they drive the verdicts), then the rest — so if rate limits cut the
+  // run short, the important classifications are already done.
+  const all = conversations.filter(c => !isEmpty(c));
+  const targets = [...all.filter(c => c._status === 'ticket'), ...all.filter(c => c._status !== 'ticket')];
   if (!targets.length) return;
-  let done = 0, failed = 0;
-  const CONC = 5;
+  let done = 0, failed = 0, firstErr = '';
+  let CONC = 4, gap = 200;   // adaptive: slows down when Groq rate-limits, speeds back up when it doesn't
   const setMsg = m => { setStatus('loading', m); const lm = document.getElementById('loadingMsg'); if (lm) lm.textContent = m; };
   setMsg(`AI analyzing conversations… 0 / ${targets.length}`);
-  for (let i = 0; i < targets.length; i += CONC) {
-    await Promise.allSettled(targets.slice(i, i + CONC).map(async c => {
+  for (let i = 0; i < targets.length; ) {
+    const batch = targets.slice(i, i + CONC); i += CONC;
+    let rateLimited = false;
+    await Promise.allSettled(batch.map(async c => {
       try {
         const res = await llmClassifyTicket(c);
         c._llmFlags = res.flags;
-        // Only tickets get a correct/investigate/fix verdict (it drives the ticket KPIs).
         if (c._status === 'ticket') c._llmVerdict = { verdict: res.verdict, reason: res.reason, requestType: res.requestType };
+      } catch (e) {
+        failed++; if (c._status === 'ticket') c._llmVerdict = null;
+        const msg = (e && e.message) || String(e);
+        if (!firstErr) firstErr = msg;
+        if (/\b429\b|rate|quota/i.test(msg)) rateLimited = true;
       }
-      catch (e) { failed++; if (c._status === 'ticket') c._llmVerdict = null; }
       done++;
     }));
-    setMsg(`AI analyzing conversations… ${done} / ${targets.length}`);
+    if (rateLimited) { CONC = 2; gap = Math.min(gap + 800, 3000); }   // back off
+    else if (CONC < 4) { CONC = Math.min(4, CONC + 1); gap = Math.max(200, gap - 300); }
+    setMsg(`AI analyzing conversations… ${done} / ${targets.length}${failed?` (${failed} failed)`:''}`);
+    if (gap) await new Promise(r => setTimeout(r, gap));
   }
-  if (failed) showToast(`AI analysis: ${failed} of ${targets.length} conversations failed (check API key)`, true);
+  if (failed) showToast(`AI: ${failed}/${targets.length} failed — ${firstErr.slice(0,90)}. Heuristic stats still work.`, true);
 }
 
 async function loadLive() {
@@ -1761,7 +1944,7 @@ function getPrevPeriodConvs(p) {
 // AGGREGATION
 // ═══════════════════════════════════════════
 function computeKPIs(convs) {
-  if (!convs.length) return { total:0,resolved:0,tickets:0,incomplete:0,noInfoTickets:0,policyTickets:0,techTickets:0,complaintTickets:0,failureTickets:0,failureInTickets:0,incompleteFailures:0,avoidableTickets:0,correctTickets:0,investigateTickets:0,fixTickets:0,capGap:0,policyBlock:0,qualityIssues:0,qualityErrors:0,qualityErrorPct:0,securityFlags:0,outOfScope:0,escalationAccPct:100,selfServicePct:0,botSuccessPct:0,fallbackPct:0,ticketRate:0,failureRate:0,avgDurMs:0,healthScore:50,expectedTickets:0 };
+  if (!convs.length) return { total:0,resolved:0,tickets:0,incomplete:0,noInfoTickets:0,policyTickets:0,techTickets:0,complaintTickets:0,failureTickets:0,failureInTickets:0,incompleteFailures:0,avoidableTickets:0,correctTickets:0,investigateTickets:0,fixTickets:0,capGap:0,policyBlock:0,qualityIssues:0,qualityErrors:0,qualityErrorPct:0,securityFlags:0,outOfScope:0,escalationAccPct:100,selfServicePct:0,botSuccessPct:0,fallbackPct:0,ticketRate:0,failureRate:0,avgDurMs:0,healthScore:50,expectedTickets:0,handledWellPct:100,answeredG:0,correctEscG:0,failG:0,scoredG:0 };
   const total       = convs.length;
   const resolved    = convs.filter(c => c._status === 'resolved').length;
   const tickets     = convs.filter(c => c._status === 'ticket').length;
@@ -1803,8 +1986,21 @@ function computeKPIs(convs) {
   // Correct escalation rate = share of tickets that were the RIGHT call (correct), vs. the ones
   // the bot probably should have handled itself (investigate + fix).
   const escalationAccPct = tickets ? Math.round(correctTickets / tickets * 100) : 100;
-  const healthScore    = Math.max(0, Math.min(100, Math.round(selfServicePct * 0.5 + (100 - qualityErrorPct) * 0.3 + escalationAccPct * 0.2)));
-  return { total, resolved, tickets, incomplete, noInfoTickets, policyTickets, techTickets, complaintTickets, failureTickets, failureInTickets, incompleteFailures, avoidableTickets, correctTickets, investigateTickets, fixTickets, expectedTickets, capGap, policyBlock, qualityIssues, qualityErrors, qualityErrorPct, securityFlags, outOfScope, escalationAccPct, selfServicePct, botSuccessPct, fallbackPct, ticketRate, failureRate, avgDurMs, healthScore };
+
+  // NEW model — "handled well" credits correct escalations (NOT the bot's fault). Measured on
+  // genuine requests only; a correct escalation counts as success alongside a self-service answer.
+  const _cls = convs.map(c => classifyConv(c));
+  const genuineCls   = _cls.filter(x => x.intent === 'genuine');
+  const answeredG    = genuineCls.filter(x => x.outcome === 'answered').length;
+  const correctEscG  = genuineCls.filter(x => x.outcome === 'correct_escalation').length;
+  const failG        = genuineCls.filter(x => ['avoidable_escalation','error','dropped_bad'].includes(x.outcome)).length;
+  const scoredG      = answeredG + correctEscG + failG;
+  const handledWellPct = scoredG ? Math.round((answeredG + correctEscG) / scoredG * 100) : 100;
+
+  // Health = 70% "handled well" (self-service + correct escalations) + 30% quality-error-free.
+  const healthScore    = Math.max(0, Math.min(100, Math.round(handledWellPct * 0.7 + (100 - qualityErrorPct) * 0.3)));
+  return { total, resolved, tickets, incomplete, noInfoTickets, policyTickets, techTickets, complaintTickets, failureTickets, failureInTickets, incompleteFailures, avoidableTickets, correctTickets, investigateTickets, fixTickets, expectedTickets, capGap, policyBlock, qualityIssues, qualityErrors, qualityErrorPct, securityFlags, outOfScope, escalationAccPct, selfServicePct, botSuccessPct, fallbackPct, ticketRate, failureRate, avgDurMs, healthScore,
+    handledWellPct, answeredG, correctEscG, failG, scoredG };
 }
 
 function computeDeltas(cur, prev) {
@@ -1832,14 +2028,22 @@ function aggregateIntents(convs) {
     .map(([k,v]) => [k, v, Math.round(v/total*100)]);
 }
 
+// "Bot Failure Points — Where to Improve Training": per topic, the share of GENUINE requests the
+// bot actually got wrong. Rules:
+//   • Only genuine requests count (testing/nonsense/abuse excluded — they aren't training signal).
+//   • A "failure" = the classification bucket is failure: avoidable escalation (bot had the answer
+//     but escalated), a real error (leak/wrong answer), or dropped while the bot was struggling.
+//   • CORRECT escalations (out-of-scope by design, needs-user-info, complaint, genuine KB gap) are
+//     NOT failures — the bot did the right thing.
 function aggregateFailures(convs) {
   const result = [];
   for (const intent of Object.keys(INTENT_RULES)) {
     if (intent === 'capability_gap' || intent === 'policy_block') continue;
-    const withIntent = convs.filter(c => c._topics.includes(intent));
+    const withIntent = convs.filter(c => c._topics.includes(intent))
+      .map(c => ({ c, cls: classifyConv(c) }))
+      .filter(x => x.cls.intent === 'genuine');
     if (!withIntent.length) continue;
-    const failed = withIntent.filter(c => c._ticketReason === 'failure' ||
-      (c._events||[]).some(e => e.type === 'unanswered'));
+    const failed = withIntent.filter(x => outcomeBucket(x.cls) === 'failure');
     const failPct = Math.round(failed.length / withIntent.length * 100);
     result.push({ intent, total: withIntent.length, failed: failed.length, failPct });
   }
@@ -1981,12 +2185,13 @@ function renderList() {
 
   el.innerHTML = filtered.map(c => {
     const qualWarn = c._qualityIssue ? '<span style="color:var(--complaint);margin-left:3px" title="Bot quality issue">⚠️</span>' : '';
+    const reviewMark = manualOverrides[c.id] ? `<span style="color:var(--accent2);margin-left:3px" title="Manually reviewed: ${manualOverrides[c.id]}">✎</span>` : '';
     const badges = c._topics.map(t => `<span class="badge b-${t}">${intentLabel(t)}</span>`).join('');
     const statusBadge = `<span class="badge b-${c._status}">${statusLabel(c._status)}</span>`;
     const channelBadge = c.channel ? `<span class="badge b-channel">${c.channel}</span>` : '';
     return `<div class="conv-item${c.id === activeId ? ' active' : ''}" data-id="${c.id}">
       <div class="ci-top">
-        <span class="ci-id">${c.id.slice(0,9)}…${qualWarn}</span>
+        <span class="ci-id">${c.id.slice(0,9)}…${qualWarn}${reviewMark}</span>
         <span class="ci-time">${timeAgo(c.updatedAt)}</span>
       </div>
       <div class="ci-preview">${esc(c._preview || '(no preview)')}</div>
@@ -2021,6 +2226,29 @@ function selectConv(id) {
   const inCnt  = c._messages.filter(m => m.direction === 'incoming').length;
   const outCnt = c._messages.filter(m => m.direction === 'outgoing').length;
 
+  // Human-review control: reclassify a ticket's outcome to correct the stats ("actual result").
+  const ov = manualOverrides[c.id];
+  const autoOutcome = (() => { const saved = manualOverrides[c.id]; delete manualOverrides[c.id];
+    const o = categorizeOutcome(c); if (saved) manualOverrides[c.id] = saved; return o; })();
+  const OC_HELP = {
+    correct: 'CORRECT: escalation was the right call — out of scope by design, needed info the customer couldn\'t give, a complaint, or the answer was never in the KB (genuine gap).',
+    investigate: 'INVESTIGATE: the bot likely HAD the answer (it is in your KB) but escalated anyway — a retrieval/flow/training fix. Check the KB: if the info was there, it belongs here.',
+    fix: 'FIX: a real bot error — leaked ${...}/template text, a wrong or misleading answer, ignored info it had, or followed a prompt-injection.'
+  };
+  const ocBtn = (v, label, color) => {
+    const on = ov === v;
+    return `<button title="${esc(OC_HELP[v]||'')}" onclick="setOverride('${c.id}','${v}')" style="font-size:12px;font-weight:600;padding:4px 11px;border-radius:8px;cursor:pointer;border:1px solid ${on?color:'var(--border2)'};background:${on?color:'transparent'};color:${on?'#fff':'var(--text2)'}">${label}</button>`;
+  };
+  const reviewBar = c._status === 'ticket' ? `
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:10px">
+      <span style="font-size:12px;color:var(--text2);font-weight:600">🔎 Review outcome:</span>
+      ${ocBtn('correct','✅ Correct','var(--accent2)')}
+      ${ocBtn('investigate','⚠️ Investigate','var(--pending)')}
+      ${ocBtn('fix','🚨 Fix','var(--complaint)')}
+      <button title="Revert to the automatic AI/rule verdict (undo your manual override)." onclick="setOverride('${c.id}','auto')" style="font-size:12px;padding:4px 11px;border-radius:8px;cursor:pointer;border:1px solid ${ov?'var(--border2)':'var(--accent2)'};background:transparent;color:var(--text2)">↺ Auto</button>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">${ov ? '✓ manually set — overrides AI' : 'auto verdict: <b style="color:var(--text2)">'+autoOutcome+'</b>'}</span>
+    </div>` : '';
+
   document.getElementById('detailPanel').innerHTML = `
     <div class="det-head">
       <div class="det-head-row1">
@@ -2046,6 +2274,7 @@ function selectConv(id) {
       <div class="story-title">Conversation Summary</div>
       <div class="story-steps">${buildStory(c)}</div>
     </div>
+    ${reviewBar}
     <div class="msg-area" id="msgArea-${c.id}">${buildMessages(c)}</div>
   `;
 
@@ -2071,11 +2300,16 @@ function buildStory(c) {
   if (ev.find(e => e.type === 'unanswered'))
     steps.push(`<div class="story-step"><span class="step-icon">❓</span><span>Bot could <b>not fully answer</b> the question</span></div>`);
   if (ev.find(e => e.type === 'ticket')) {
-    const r = c._ticketReason;
-    const reasonInfo = TICKET_REASON_LABELS[r];
-    const icon = r === 'failure' ? '⚠️' : '🎫';
-    const reasonStr = reasonInfo ? ` <span style="color:${reasonInfo.color};font-size:11px">(${reasonInfo.label})</span>` : '';
-    steps.push(`<div class="story-step"><span class="step-icon">${icon}</span><span><b>Support ticket created</b>${reasonStr} — agent will follow up</span></div>`);
+    // Label the ticket by its OUTCOME (consistent with the rest of the app), not the crude
+    // _ticketReason default — so a correct escalation isn't mislabeled "Bot Could Have Answered".
+    const oc = categorizeOutcome(c);
+    const OC = {
+      correct:     { label:'Correct escalation',     color:'var(--accent2)',   icon:'🎫' },
+      investigate: { label:'Bot Could Have Answered', color:'var(--pending)',   icon:'⚠️' },
+      fix:         { label:'Bot Error',              color:'var(--complaint)', icon:'🚨' }
+    }[oc] || { label:'', color:'', icon:'🎫' };
+    const reasonStr = OC.label ? ` <span style="color:${OC.color};font-size:11px">(${OC.label})</span>` : '';
+    steps.push(`<div class="story-step"><span class="step-icon">${OC.icon}</span><span><b>Support ticket created</b>${reasonStr} — agent will follow up</span></div>`);
   }
   if (ev.find(e => e.type === 'ticket_offered')) {
     const contact = extractContactInfo(c);
@@ -2233,6 +2467,7 @@ function highlightKw(html) {
 // ═══════════════════════════════════════════
 const METRIC_INFO = {
   // health bars
+  'Bot handled well': 'Of genuine requests the bot was scored on, the share it handled correctly — either answered on its own (self-service) OR correctly escalated (out-of-scope, needed info the user couldn\'t give, a complaint, or a genuine knowledge gap). A correct escalation is NOT the bot\'s fault, so it counts as a success. Nonsense/abuse and users who simply left are excluded.',
   'Bot resolution rate': 'Share of conversations the bot closed on its own, without creating a ticket for a human agent.',
   'Quality error-free':  'Share of conversations with NONE of the 4 real quality errors (internal/RAG data leaked, low-confidence answer, found-but-didn\'t-answer, or a security risk).',
   'Correct escalation rate': 'Of all tickets the bot created, the share that were the RIGHT call to escalate (verdict "correct" — out-of-scope by design, a complaint, or a genuine knowledge gap). The rest are tickets the bot probably should have handled itself (investigate + fix). Example: 28 correct of 52 tickets = 54%. Higher is better.',
@@ -2245,7 +2480,7 @@ const METRIC_INFO = {
   'Quality Errors':   'The 4 real errors that matter: internal/RAG data sent to the user, an answer given with low confidence, info found but the question not answered, or a security risk.',
   'Security Flags':   'Prompt-injection attempts by the user (e.g. "ignore your instructions", "du bist jetzt…", "jailbreak"). The bot sending a link/invoice is tracked separately as a quality error, not here.',
   'Out-of-Scope':     'User asked for something the bot is designed NOT to do (recommend or compare products, send invoices/links/prices, view images, cancel or edit orders). Escalating these is CORRECT, not a failure.',
-  'Health Score':     'Composite score: 50% bot resolution rate + 30% quality error-free + 20% escalation accuracy.'
+  'Health Score':     'Composite score: 70% "bot handled well" (self-service answers + correct escalations, on genuine requests) + 30% quality error-free. Correct escalations count as success, not failure.'
 };
 function infoIc(label) {
   const text = METRIC_INFO[label];
@@ -2262,7 +2497,7 @@ function renderHealthCard(kpis, delta) {
     ? `<span class="kpi-delta ${d.dir}" style="font-size:12px">${d.str} vs prev</span>`
     : '';
   const bars = [
-    { label:'Bot resolution rate',   val:kpis.selfServicePct,        color:'var(--resolved)' },
+    { label:'Bot handled well',      val:kpis.handledWellPct,        color:'var(--resolved)' },
     { label:'Quality error-free',    val:100-kpis.qualityErrorPct,   color:'var(--health-green)' },
     { label:'Correct escalation rate', val:kpis.escalationAccPct,    color:'var(--ticket)' }
   ];
@@ -2270,6 +2505,7 @@ function renderHealthCard(kpis, delta) {
     <div class="health-score-circle ${cls}">${s}</div>
     <div class="health-detail">
       <div class="health-title">Bot Health Score — ${label} ${dHtml}</div>
+      <div style="font-size:11px;color:var(--text2);margin:2px 0 8px">On ${kpis.scoredG} genuine requests: <b style="color:var(--resolved)">${kpis.answeredG} answered</b> + <b style="color:var(--accent2)">${kpis.correctEscG} correctly escalated</b> = handled well · <b style="color:var(--pending)">${kpis.failG} need attention</b>. Correct escalations don't count against the bot.</div>
       <div class="health-bars">${bars.map(b => `
         <div class="health-bar-row">
           <span class="health-bar-label">${b.label}${infoIc(b.label)}</span>
@@ -2325,14 +2561,14 @@ function renderIntentDistribution(intents) {
 }
 
 function renderBotFailuresPanel(failures) {
-  if (!failures.length) return `<div style="text-align:center;padding:16px;color:var(--muted);font-size:13px">✅ No bot failures detected in this period — everything is working well!</div>`;
+  if (!failures.length) return `<div style="text-align:center;padding:16px;color:var(--muted);font-size:13px">✅ No bot failures on genuine requests in this period — correct escalations don't count.</div>`;
   return `<div class="fail-grid">${failures.map(r => `
     <div class="fail-card">
       <div class="fail-card-top">
         <span class="fail-card-intent">${intentLabel(r.intent)}</span>
         <span class="fail-card-pct">${r.failPct}%</span>
       </div>
-      <div class="fail-card-sub">${r.failed} of ${r.total} conversations — bot could not resolve</div>
+      <div class="fail-card-sub">${r.failed} of ${r.total} genuine requests mishandled (avoidable escalation, error, or user gave up)</div>
       <div class="fail-card-bar"><div class="fail-card-fill" style="width:${r.failPct}%"></div></div>
     </div>`).join('')}</div>`;
 }
@@ -2813,12 +3049,14 @@ function renderHighlights() {
         triage:   {sev:'high', label:'Missing buttons — topic menu',          def:'Bot invited the user to choose an option at the start but showed no topic buttons — user had to type.'}
       }[c._buttonGapKind] || {sev:'medium', label:'Missing buttons', def:'Bot asked the user to choose but showed no buttons.'};
       push(c, META.sev, META.label, '🔘', c._buttonGapText || META.def);
-    } else if (f.buttonIssue) {
-      push(c, 'medium', 'Missing buttons (AI-detected)', '🔘',
-        f.uxNote || 'Bot asked the user to choose but showed no clickable buttons.');
+    }
+    // Customer explicitly said they see no buttons/options — the most reliable missing-button signal.
+    if (c._buttonComplaint) {
+      push(c, 'high', 'Missing buttons — customer complained', '🔘',
+        c._buttonComplaintText || 'Customer said they see no buttons/options.');
     }
     // 4) Other poor experience the AI noticed (not already covered above)
-    if (f.uxNote && f.severity && f.severity!=='none' && !f.buttonIssue && !isFix && !c._leak)
+    if (f.uxNote && f.severity && f.severity!=='none' && !c._buttonGap && !c._buttonComplaint && !isFix && !c._leak)
       push(c, f.severity==='high'?'high':f.severity==='low'?'low':'medium', 'Poor experience', '⚠️', f.uxNote);
   });
 
@@ -3182,6 +3420,87 @@ function renderTopicsInsights() {
     ? `<span style="font-size:11px;font-weight:600;color:var(--accent2);background:rgba(91,106,245,.12);border:1px solid rgba(91,106,245,.25);border-radius:8px;padding:2px 8px">🤖 AI-reviewed ${aiReviewed}/${ticketConvs.length} tickets</span>`
     : `<span style="font-size:11px;color:var(--muted);background:var(--surface3);border-radius:8px;padding:2px 8px">Heuristic only — add a Groq API key in Settings for AI re-analysis</span>`;
 
+  // ══ NEW: Actual Bot Results + Top Questions (built from classifyConv) ══
+  const classed = periodConvs.map(c => ({ c, cls: classifyConv(c) }));
+  const intentCounts = { genuine:0, testing:0, abuse:0 };
+  classed.forEach(x => intentCounts[x.cls.intent]++);
+  const genuine = classed.filter(x => x.cls.intent === 'genuine');
+  const buckets = { success:0, failure:0, excluded:0 };
+  genuine.forEach(x => buckets[outcomeBucket(x.cls)]++);
+  const outc = {}; ['answered','correct_escalation','avoidable_escalation','error','dropped_ok','dropped_bad','pending'].forEach(k => outc[k]=0);
+  genuine.forEach(x => outc[x.cls.outcome]++);
+  const escReasons = {}; genuine.filter(x=>x.cls.outcome==='correct_escalation').forEach(x=>{ escReasons[x.cls.escReason]=(escReasons[x.cls.escReason]||0)+1; });
+  const scored = buckets.success + buckets.failure;
+  const successPct = scored ? Math.round(buckets.success / scored * 100) : 0;
+  const aiOn = classed.some(x => x.c._llmFlags);
+
+  const OUTCOME_META = {
+    answered:            { icon:'✅', label:'Answered',              color:'var(--resolved)',  desc:'Bot resolved it without escalating' },
+    correct_escalation:  { icon:'🤝', label:'Correctly escalated',   color:'var(--accent2)',   desc:"Bot couldn't/shouldn't answer — a human should" },
+    avoidable_escalation:{ icon:'⚠️', label:'Avoidable escalation',  color:'var(--pending)',   desc:'Bot likely had the answer but escalated anyway' },
+    error:               { icon:'🚨', label:'Error',                 color:'var(--complaint)', desc:'Real bot mistake — leak, wrong answer, etc.' },
+    dropped_ok:          { icon:'🟢', label:'Dropped — bot was fine', color:'var(--muted)',    desc:'User left while the bot was helping — not a failure' },
+    dropped_bad:         { icon:'🔴', label:'Dropped — bot struggling',color:'var(--complaint)',desc:'User left because the bot was stuck/looping' },
+    pending:             { icon:'⏳', label:'In progress',           color:'var(--muted)',     desc:'Conversation still open' }
+  };
+  const ESC_LABELS = { out_of_scope:'Out of scope by design', needs_user_info:'Needed info the user couldn’t give', complaint:'Complaint → human', kb_gap:'Genuine knowledge gap', had_info:'(avoidable)' };
+
+  const barRow = (m, n) => {
+    const pct = genuine.length ? Math.round(n / genuine.length * 100) : 0;
+    return `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="font-size:16px;width:22px;text-align:center;flex-shrink:0">${m.icon}</div>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          <span style="font-size:13px;font-weight:600;color:${m.color}">${m.label}</span>
+          <span style="font-size:13px;font-weight:700;color:${m.color}">${n} <span style="color:var(--muted);font-weight:400;font-size:11px">(${pct}%)</span></span>
+        </div>
+        <div style="height:5px;background:var(--surface3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${m.color};border-radius:3px"></div></div>
+        <div style="font-size:11px;color:var(--muted);margin-top:3px">${m.desc}</div>
+      </div></div>`;
+  };
+  const escBreakdown = Object.keys(escReasons).filter(k=>k!=='had_info').length
+    ? `<div style="margin:8px 0 4px 34px;font-size:11px;color:var(--text2)">${Object.entries(escReasons).filter(([k])=>k!=='had_info').sort((a,b)=>b[1]-a[1]).map(([k,n])=>`<span style="display:inline-block;margin:2px 10px 2px 0">• ${esc(ESC_LABELS[k]||k)}: <b>${n}</b></span>`).join('')}</div>` : '';
+
+  const actualResultsHtml = `<div class="chart-card">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap"><h3 style="margin:0">🎯 Actual Bot Results</h3>${aiBadge}</div>
+    <p style="font-size:12px;color:var(--text2);margin:10px 0 14px">Measured on <b>${genuine.length} genuine requests</b> — <span title="excluded from the score">${intentCounts.testing} testing/nonsense · ${intentCounts.abuse} abuse excluded</span>${aiOn?'':' <i style="color:var(--pending)">· add a Groq key & reload for the intent split</i>'}. A user simply leaving, or junk input, never counts against the bot.</p>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:16px">
+      <div style="font-size:40px;font-weight:800;color:${successPct>=80?'var(--resolved)':successPct>=60?'var(--pending)':'var(--complaint)'}">${successPct}%</div>
+      <div style="font-size:13px;color:var(--text2);line-height:1.5">Bot handled <b>${successPct}%</b> of genuine requests well<br><span style="color:var(--muted);font-size:11px">(answered + correctly escalated) of ${scored} scored · ${buckets.excluded} neutral (dropped-fine / in-progress)</span></div>
+    </div>
+    ${['answered','correct_escalation'].map(k=>barRow(OUTCOME_META[k],outc[k])).join('')}
+    ${escBreakdown}
+    ${['avoidable_escalation','error','dropped_bad','dropped_ok','pending'].filter(k=>outc[k]>0).map(k=>barRow(OUTCOME_META[k],outc[k])).join('')}
+  </div>`;
+
+  // ── Top questions & intents ──
+  const qAgg = {};
+  genuine.forEach(x => {
+    const key = (x.cls.question || 'Other').trim() || 'Other';
+    if (!qAgg[key]) qAgg[key] = { n:0, success:0, fail:0 };
+    qAgg[key].n++;
+    const b = outcomeBucket(x.cls);
+    if (b === 'success') qAgg[key].success++; else if (b === 'failure') qAgg[key].fail++;
+  });
+  const topQ = Object.entries(qAgg).sort((a,b)=>b[1].n-a[1].n).slice(0,12);
+  const maxQ = topQ[0]?.[1].n || 1;
+  const topQuestionsHtml = `<div class="chart-card">
+    <h3>📊 Top Questions & Intents</h3>
+    <p style="font-size:12px;color:var(--text2);margin:8px 0 14px">What genuine customers ask most — with how well the bot handles each. Low success + high volume = your fix priorities.</p>
+    ${topQ.length ? topQ.map(([q,d])=>{
+      const okPct = (d.success+d.fail) ? Math.round(d.success/(d.success+d.fail)*100) : null;
+      const col = okPct===null?'var(--muted)':okPct>=80?'var(--resolved)':okPct>=50?'var(--pending)':'var(--complaint)';
+      return `<div style="display:flex;align-items:center;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)">
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;justify-content:space-between;gap:8px;margin-bottom:4px">
+            <span style="font-size:13px;color:var(--text);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(q)}</span>
+            <span style="font-size:12px;color:var(--text2);flex-shrink:0">${d.n}× ${okPct!==null?`· <span style="color:${col};font-weight:700">${okPct}% ok</span>`:''}</span>
+          </div>
+          <div style="height:5px;background:var(--surface3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${Math.round(d.n/maxQ*100)}%;background:var(--product-inquiry)"></div></div>
+        </div></div>`;
+    }).join('') : '<p style="font-size:12px;color:var(--muted)">No genuine requests in this period.</p>'}
+  </div>`;
+
   // ── Bot Quality Dashboard ─────────────────────────────────────────
   // Design limits: requests bot is programmed NOT to handle — escalating is CORRECT
   const limitCounts = {};
@@ -3396,6 +3715,9 @@ function renderTopicsInsights() {
       <div class="kpi" title="Real quality errors that need fixing: RAG/internal data leaked, low-confidence answer given, found info but didn't answer, security/prompt-injection"><div class="kpi-val" style="color:${fixConvs.length>0?'var(--complaint)':'var(--resolved)'}">${fixConvs.length || '✓ 0'}</div><div class="kpi-label">🚨 Fix Now</div></div>
       <div class="kpi" title="Requests that are out of scope by design (bot correctly declined)"><div class="kpi-val" style="color:var(--resolved)">${totalLimitConvs}</div><div class="kpi-label">Out-of-Scope ✓</div></div>
     </div>
+
+    ${actualResultsHtml}
+    ${topQuestionsHtml}
 
     <div class="chart-card">
       <h3>Bot Quality Dashboard</h3>
@@ -3646,6 +3968,8 @@ function renderAnalytics() {
       <span style="font-size:12px;color:var(--muted);line-height:1.4">Webchat sessions that opened but exchanged zero messages. <b style="color:var(--text2)">Excluded from every statistic and analytic on this dashboard</b> — shown here for context only, they do not affect any rate, KPI, or chart.</span>
     </div>
 
+    ${renderLanguageCard(periodConvs)}
+
     <div class="charts-row">
       <div class="chart-card">
         <h3>Daily Trend</h3>
@@ -3675,6 +3999,92 @@ function renderAnalytics() {
     renderAnalytics();
     renderFilterChips(); renderList();
   }));
+}
+
+// ═══════════════════════════════════════════
+// COVERAGE REPORT EXPORT (Excel-friendly CSV)
+// ═══════════════════════════════════════════
+function csvCell(v) { return `"${String(v==null?'':v).replace(/"/g,'""')}"`; }
+function csvRow(arr) { return arr.map(csvCell).join(','); }
+
+// Collects the number info + lists from Analytics & Topics: out-of-scope limitations, top
+// questions/intents, and where the bot couldn't answer — for the current period.
+function buildReportCSV() {
+  const convs = filterByPeriod(activePeriod).filter(c => !isEmpty(c));
+  const label = {'1d':'Last 24 hours','7d':'Last 7 days','14d':'Last 14 days','30d':'Last 30 days'}[activePeriod] || activePeriod;
+  const L = [];
+  L.push(csvRow(['Botpress Bot Coverage Report']));
+  L.push(csvRow(['Period', label]));
+  L.push(csvRow(['Generated', new Date().toLocaleString()]));
+  L.push(csvRow(['Conversations analyzed', convs.length]));
+  L.push('');
+
+  // Summary numbers (from the classification)
+  const classed = convs.map(c => ({ c, cls: classifyConv(c) }));
+  const genuine = classed.filter(x => x.cls.intent === 'genuine');
+  const b = { success:0, failure:0, excluded:0 }; genuine.forEach(x => b[outcomeBucket(x.cls)]++);
+  const scored = b.success + b.failure;
+  L.push(csvRow(['SUMMARY']));
+  L.push(csvRow(['Metric','Value']));
+  L.push(csvRow(['Genuine requests', genuine.length]));
+  L.push(csvRow(['Testing / nonsense', classed.filter(x=>x.cls.intent==='testing').length]));
+  L.push(csvRow(['Abuse', classed.filter(x=>x.cls.intent==='abuse').length]));
+  L.push(csvRow(['Answered by bot (self-service)', genuine.filter(x=>x.cls.outcome==='answered').length]));
+  L.push(csvRow(['Correctly escalated', genuine.filter(x=>x.cls.outcome==='correct_escalation').length]));
+  L.push(csvRow(['Avoidable escalation', genuine.filter(x=>x.cls.outcome==='avoidable_escalation').length]));
+  L.push(csvRow(['Errors', genuine.filter(x=>x.cls.outcome==='error').length]));
+  L.push(csvRow(['Bot handled well %', scored ? Math.round(b.success/scored*100) : 0]));
+  L.push('');
+
+  // 1) Out-of-scope limitations the users requested
+  L.push(csvRow(['OUT-OF-SCOPE LIMITATIONS REQUESTED (bot correctly declined)']));
+  L.push(csvRow(['Limitation','Requests']));
+  BOT_LIMITS.forEach(bl => {
+    const n = convs.filter(c => detectBotLimitRequests(c).includes(bl.key)).length;
+    if (n > 0) L.push(csvRow([bl.label, n]));
+  });
+  L.push('');
+
+  // 2) Top questions & intents (genuine requests)
+  const qAgg = {};
+  genuine.forEach(x => { const k = (x.cls.question||'Other').trim() || 'Other';
+    if (!qAgg[k]) qAgg[k] = { n:0, s:0, f:0 }; qAgg[k].n++;
+    const bk = outcomeBucket(x.cls); if (bk==='success') qAgg[k].s++; else if (bk==='failure') qAgg[k].f++; });
+  L.push(csvRow(['TOP QUESTIONS & INTENTS (genuine requests)']));
+  L.push(csvRow(['Question / Intent','Count','Handled well %']));
+  Object.entries(qAgg).sort((a,b)=>b[1].n-a[1].n).forEach(([q,d]) => {
+    const ok = (d.s+d.f) ? Math.round(d.s/(d.s+d.f)*100) : '';
+    L.push(csvRow([q, d.n, ok]));
+  });
+  L.push('');
+
+  // 3) Where the bot could NOT answer — knowledge gaps / escalations to review (not out-of-scope)
+  const gaps = convs.filter(c => c._status === 'ticket'
+    && !detectBotLimitRequests(c).length && !detectBotDeclinedScope(c));
+  L.push(csvRow(['WHERE THE BOT COULD NOT ANSWER (knowledge gaps / review) — ' + gaps.length + ' conversations']));
+  L.push(csvRow(['Question','Topic','Outcome','Reviewed','Conversation ID']));
+  gaps.forEach(c => {
+    const q = (c._analysis?.primaryQuestion || c._preview || '').replace(/\s+/g,' ').slice(0,160);
+    const topic = (c._topics||[]).map(intentLabel).join('; ');
+    L.push(csvRow([q, topic, categorizeOutcome(c), manualOverrides[c.id] ? 'yes' : '', c.id]));
+  });
+
+  return '﻿' + L.join('\r\n');   // BOM so Excel reads UTF-8 (German umlauts) correctly
+}
+
+function downloadReport() {
+  if (!conversations.length) { showToast('Load conversations first', true); return; }
+  try {
+    const csv  = buildReportCSV();
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url;
+    a.download = `bot-coverage-report_${activePeriod}_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast('Report downloaded');
+  } catch (e) { showToast('Export failed: ' + e.message, true); }
 }
 
 // ═══════════════════════════════════════════
@@ -3731,20 +4141,23 @@ function openModal() {
   document.getElementById('iPAT').value          = cfg.pat;
   document.getElementById('iBotId').value        = cfg.botId;
   document.getElementById('iGroqKey').value = cfg.groqKey || '';
+  document.getElementById('iGroqModel').value = cfg.groqModel || DEFAULT_LLM_MODEL;
   document.getElementById('iFetchDepth').value   = cfg.fetchDepth || '30d';
   document.getElementById('modal').classList.remove('hidden');
 }
 function closeModal() { document.getElementById('modal').classList.add('hidden'); }
 
 document.getElementById('btnSettingsHdr').addEventListener('click', openModal);
+document.getElementById('btnExport').addEventListener('click', downloadReport);
 document.getElementById('btnCancelModal').addEventListener('click', closeModal);
 
 document.getElementById('btnConnect').addEventListener('click', () => {
   const pat   = document.getElementById('iPAT').value.trim();
   const botId = document.getElementById('iBotId').value.trim();
   const groqKey = document.getElementById('iGroqKey').value.trim();
+  const groqModel = document.getElementById('iGroqModel').value.trim() || DEFAULT_LLM_MODEL;
   if (!pat || !botId) { showToast('Please enter PAT and Bot ID', true); return; }
-  cfg = { pat, botId, groqKey, refreshInterval: 0, fetchDepth: document.getElementById('iFetchDepth').value || '30d' };
+  cfg = { pat, botId, groqKey, groqModel, refreshInterval: 0, fetchDepth: document.getElementById('iFetchDepth').value || '30d' };
   saveCfg(); closeModal();
   clearInterval(refreshTimer);
   loadLive();
@@ -3798,6 +4211,7 @@ document.getElementById('searchInput').addEventListener('input', e => {
 // INIT
 // ═══════════════════════════════════════════
 loadCfg();
+loadOverrides();
 cfg.refreshInterval = 0; // auto-refresh disabled — use the manual ↻ Refresh button
 if (cfg.pat && cfg.botId) {
   closeModal();
