@@ -945,6 +945,13 @@ function detectBotLimitRequests(conv) {
   return BOT_LIMITS.filter(bl => bl.kw.some(p => p.test(inText))).map(bl => bl.key);
 }
 
+// Replacement / spare-parts requests (Ersatzteile) — baseline for the new Ersatz knowledge base.
+const REPLACEMENT_RE = /\bersatz|nachbestell|nachkaufen|nachbestellung|replacement\s*part|spare\s*part|neue[sr]?\s+(schloss|glas|klingel|taster|namensschild|deckel|abdeckung|batterie|akku|schlüssel)/i;
+function isReplacementPart(conv) {
+  const inText = (conv._messages||[]).filter(m=>m.direction==='incoming').map(m=>getText(m)).join(' ');
+  return REPLACEMENT_RE.test(inText);
+}
+
 // The bot EXPLICITLY declining an out-of-scope request in ITS OWN words ("Ich kann keine Produkte
 // empfehlen", "kann keine Rechnung senden", "kann bei der Anfertigung nicht helfen") is a
 // definitive "correct escalation" signal — stronger than the AI's guess at the user's request type.
@@ -2211,7 +2218,8 @@ function renderFilterChips() {
     { f:'incomplete', label:'📋 Incomplete',  n: active.filter(c=>c._status==='incomplete').length },
     { f:'investigate', label:'🔍 Investigate', n: active.filter(c=>c._status==='ticket' && categorizeOutcome(c)==='investigate').length },
     { f:'quality',    label:'⚠ Quality',      n: active.filter(c=>c._qualityIssue || detectQualityErrors(c).hasAny).length },
-    { f:'outofscope', label:'🚫 Out-of-Scope',n: active.filter(c=>detectBotLimitRequests(c).length).length }
+    { f:'outofscope', label:'🚫 Out-of-Scope',n: active.filter(c=>detectBotLimitRequests(c).length).length },
+    { f:'replacement',label:'🔧 Ersatzteile', n: active.filter(c=>isReplacementPart(c)).length }
   ].filter(s => s.n > 0);
 
   const all = [{ f:'all', label:'All', n: active.length }, ...intentChips, ...special];
@@ -2236,6 +2244,7 @@ function renderList() {
     if (activeFilter === 'quality'    && !c._qualityIssue && !detectQualityErrors(c).hasAny) return false;
     if (activeFilter === 'investigate' && !(c._status==='ticket' && categorizeOutcome(c)==='investigate')) return false;
     if (activeFilter === 'outofscope' && !detectBotLimitRequests(c).length) return false;
+    if (activeFilter === 'replacement' && !isReplacementPart(c)) return false;
     if (KNOWN.includes(activeFilter) && !c._topics.includes(activeFilter)) return false;
     if (q) {
       const hay = (c.id + c._msgText + JSON.stringify(c.tags||{})).toLowerCase();
